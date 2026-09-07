@@ -3,30 +3,35 @@ import type { Story, StoryFilter } from '../types/story';
 const FALLBACK_ERROR_MESSAGE = 'Unable to load Hacker News stories. Please try again.';
 
 /**
- * Structured error shape the backend may return, e.g.:
- * { response: false, statusCode: 502, message: "...", result: [], errorDetail: "CRAWLING_ERROR" }
- * All fields are optional here because we don't fully trust an external response body.
+ * Every response from this backend — success or error, including 404/405 on
+ * routes that don't exist — has exactly this envelope, with `statusCode`
+ * mirroring the actual HTTP status. `response` (not `res.ok`) is what tells
+ * success from error; `errorDetail` is a safe, generic, user-facing
+ * description of the error (never the raw exception message).
  */
-type BackendErrorBody = {
-  message?: string;
-  errorDetail?: string;
+type ApiResponse<T> = {
+  response: boolean;
+  statusCode: number;
+  message: string;
+  result: T | null;
+  errorDetail: string | null;
 };
 
 /** Error thrown by the stories API with a message that is always safe to show the user. */
 export class StoriesApiError extends Error {
   readonly statusCode?: number;
-  readonly errorDetail?: string;
 
-  constructor(message: string, options?: { statusCode?: number; errorDetail?: string }) {
+  constructor(message: string, statusCode?: number) {
     super(message);
     this.name = 'StoriesApiError';
-    this.statusCode = options?.statusCode;
-    this.errorDetail = options?.errorDetail;
+    this.statusCode = statusCode;
   }
 }
 
-function isBackendErrorBody(value: unknown): value is BackendErrorBody {
-  return typeof value === 'object' && value !== null;
+function isApiResponseEnvelope(value: unknown): value is ApiResponse<unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.response === 'boolean' && typeof candidate.message === 'string';
 }
 
 function isStory(value: unknown): value is Story {
@@ -40,23 +45,10 @@ function isStory(value: unknown): value is Story {
   );
 }
 
-/** Extracts a safe, user-friendly message from a non-OK response, falling back when needed. */
-async function readErrorMessage(res: Response): Promise<{ message: string; errorDetail?: string }> {
-  try {
-    const body: unknown = await res.json();
-    if (isBackendErrorBody(body) && typeof body.message === 'string' && body.message.trim()) {
-      return { message: body.message, errorDetail: body.errorDetail };
-    }
-  } catch {
-    // Response body was missing or not valid JSON — use the fallback below.
-  }
-  return { message: FALLBACK_ERROR_MESSAGE };
-}
-
 /**
  * Fetches the first 30 Hacker News stories for the given filter.
- * The backend owns filtering, sorting and word counting — the result is
- * returned exactly as received, in the same order.
+ * The backend always answers with the same envelope regardless of HTTP
+ * status, so the body — not `res.ok` — decides success or error here.
  */
 export async function getStories(filter: StoryFilter, signal?: AbortSignal): Promise<Story[]> {
   const baseUrl = import.meta.env.VITE_API_BASE_URL;
@@ -70,15 +62,20 @@ export async function getStories(filter: StoryFilter, signal?: AbortSignal): Pro
     throw new StoriesApiError(FALLBACK_ERROR_MESSAGE);
   }
 
-  if (!res.ok) {
-    const { message, errorDetail } = await readErrorMessage(res);
-    throw new StoriesApiError(message, { statusCode: res.status, errorDetail });
+  const rawBody: unknown = await res.json().catch(() => null);
+  const body = isApiResponseEnvelope(rawBody) ? rawBody : null;
+
+  if (!body || !body.response) {
+    // errorDetail is the safe, user-facing description; message is a short
+    // title-like fallback if it's missing for some reason.
+    const displayMessage = body?.errorDetail ?? body?.message ?? FALLBACK_ERROR_MESSAGE;
+    throw new StoriesApiError(displayMessage, body?.statusCode ?? res.status);
   }
 
-  const data: unknown = await res.json();
-  if (!Array.isArray(data) || !data.every(isStory)) {
+  const stories = body.result;
+  if (!Array.isArray(stories) || !stories.every(isStory)) {
     throw new StoriesApiError(FALLBACK_ERROR_MESSAGE);
   }
 
-  return data;
+  return stories;
 }
